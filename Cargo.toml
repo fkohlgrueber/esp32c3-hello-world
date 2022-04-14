@@ -1,0 +1,12 @@
+[package]
+name = "esp32c3-hello-world"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+esp32c3-hal = { git = "https://github.com/esp-rs/esp-hal.git" }
+nb = "1.0.0"
+panic-halt = "0.2.0"
+riscv-rt = "0.8.1"
