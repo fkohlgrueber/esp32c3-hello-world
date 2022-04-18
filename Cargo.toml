@@ -7,6 +7,9 @@ edition = "2021"
 
 [dependencies]
 esp32c3-hal = { git = "https://github.com/esp-rs/esp-hal.git" }
+esp-hal-common = { git = "https://github.com/esp-rs/esp-hal.git" }
 nb = "1.0.0"
 panic-halt = "0.2.0"
 riscv-rt = "0.8.1"
+# bare-metal = "1.0.0"
+# riscv = "0.7.0"

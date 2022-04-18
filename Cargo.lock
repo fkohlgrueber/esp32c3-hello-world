@@ -133,6 +133,7 @@ dependencies = [
 name = "esp32c3-hello-world"
 version = "0.1.0"
 dependencies = [
+ "esp-hal-common",
  "esp32c3-hal",
  "nb 1.0.0",
  "panic-halt",
