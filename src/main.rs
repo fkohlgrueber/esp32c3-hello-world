@@ -5,17 +5,27 @@ use core::fmt::Write;
 
 use esp_hal_common::{gpio::OutputPin, types::OutputSignal};
 
-use esp32c3_hal::{gpio::IO, pac::{self, Peripherals}, prelude::*, Delay, RtcCntl, Serial, Timer};
+use esp32c3_hal::{
+    gpio::IO,
+    pac::{self, Peripherals},
+    prelude::*,
+    Delay, RtcCntl, Serial, Timer,
+};
 use panic_halt as _;
 use riscv_rt::entry;
 
-const MORSE_DATA: [Item; 13] = init_morse_data();
+const WS2812_T0H_NS: u32 = 400;
+const WS2812_T0L_NS: u32 = 800;
+const WS2812_T1H_NS: u32 = 850;
+const WS2812_T1L_NS: u32 = 450;
 
 #[derive(Debug, Clone, Copy)]
 struct Item(u32);
 
 impl Item {
     const fn new(duration0: u16, level0: bool, duration1: u16, level1: bool) -> Self {
+        assert!(duration0 < (1 << 15));
+        assert!(duration1 < (1 << 15));
         Item(
             duration0 as u32
                 | ((level0 as u32) << 15)
@@ -25,38 +35,20 @@ impl Item {
     }
 }
 
-const fn init_morse_data() -> [Item; 13] {
-    let dot = Item::new(32767, true, 32767, false);
-    let long = Item::new(32767, true, 32767, true);
-    let space = Item::new(32767, false, 32767, false);
-    let end = Item::new(0, true, 0, false);
-    let morse_esp = [
-        // E : dot
-        dot, 
-        space, 
-        // S : dot, dot, dot
-        dot, 
-        dot, 
-        dot, 
-        space, 
-        // P : dot, dash, dash, dot
-        dot, 
-        long, dot, 
-        long, dot, 
-        dot, 
-        // RMT end marker
-        end,
-    ];
-    morse_esp
-}
-
 pub struct RMT0 {
     rmt: pac::RMT,
     data: &'static mut [Item],
+    counter_clk_hz: u32,
 }
 
 impl RMT0 {
-    pub fn new(mut channel: impl OutputPin<OutputSignal = OutputSignal>, rmt: pac::RMT, system: &pac::SYSTEM, clk_div: u8, idle: Option<bool>) -> Self {
+    pub fn new(
+        mut channel: impl OutputPin<OutputSignal = OutputSignal>,
+        rmt: pac::RMT,
+        system: &pac::SYSTEM,
+        clk_div: u8,
+        idle: Option<bool>,
+    ) -> Self {
         // activate RMT in SYSTEM registers
         let perip_rst_en0 = &system.perip_rst_en0;
         perip_rst_en0.modify(|_, w| w.rmt_rst().set_bit());
@@ -65,24 +57,29 @@ impl RMT0 {
         perip_clk_en0.modify(|_, w| w.rmt_clk_en().set_bit());
         perip_rst_en0.modify(|_, w| w.rmt_rst().clear_bit());
 
-
-        
+        // aliases for quick access to the most relevant registers
         let sys_conf = &rmt.sys_conf;
         let ch0conf0 = &rmt.ch0conf0;
-    
+
         // enable memory access
         sys_conf.modify(|_, w| w.apb_fifo_mask().set_bit());
 
         // setup clock and divider
         sys_conf.modify(|_r, w| w.rmt_sclk_active().clear_bit());
         sys_conf.modify(|_r, w| unsafe {
-            w
-                .rmt_sclk_sel().bits(1)
-                .rmt_sclk_div_num().bits(clk_div)
-                .rmt_sclk_div_a().bits(0)
-                .rmt_sclk_div_b().bits(0)
-                .rmt_sclk_active().set_bit()
+            w.rmt_sclk_sel()
+                .bits(1) // use APB_CLK
+                .rmt_sclk_div_num()
+                .bits(0)
+                .rmt_sclk_div_a()
+                .bits(0)
+                .rmt_sclk_div_b()
+                .bits(0)
+                .rmt_sclk_active()
+                .set_bit()
         });
+        ch0conf0
+            .modify(|_, w| unsafe { w.div_cnt_ch0().bits(clk_div).carrier_en_ch0().clear_bit() });
 
         // setup idle level
         match idle {
@@ -90,13 +87,18 @@ impl RMT0 {
                 ch0conf0.modify(|_, w| w.idle_out_en_ch0().set_bit().idle_out_lv_ch0().bit(lv));
             }
             None => {
-                ch0conf0.modify(|_, w| w.idle_out_en_ch0().clear_bit().idle_out_lv_ch0().clear_bit());
+                ch0conf0.modify(|_, w| {
+                    w.idle_out_en_ch0()
+                        .clear_bit()
+                        .idle_out_lv_ch0()
+                        .clear_bit()
+                });
             }
         }
 
         // route to output
         channel.connect_peripheral_to_output(OutputSignal::RMT_SIG_0);
-        
+
         // calculate data slice for the channel's memory
         let rmt_base_address = esp32c3_hal::pac::RMT::PTR;
         let ch0_data: &'static mut [Item] = unsafe {
@@ -107,6 +109,7 @@ impl RMT0 {
         RMT0 {
             rmt,
             data: ch0_data,
+            counter_clk_hz: 80_000_000 / clk_div as u32  // TODO: this needs to change when other clocks / clock frequencies are used.
         }
     }
 
@@ -123,6 +126,53 @@ impl RMT0 {
         ch0conf0.modify(|_, w| w.reg_conf_update_ch0().set_bit());
         ch0conf0.modify(|_, w| w.tx_start_ch0().set_bit());
     }
+
+    pub fn counter_clk_hz(&self) -> u32 {
+        self.counter_clk_hz
+    }
+}
+
+
+pub struct Led {
+    rmt: RMT0,
+    bit0: Item,
+    bit1: Item,
+}
+
+impl Led {
+    pub fn new(rmt: RMT0) -> Self {
+        let ratio = rmt.counter_clk_hz() as f32 / 1e9;
+        let ws2812_t0h_ticks = (ratio * WS2812_T0H_NS as f32) as u16; 
+        let ws2812_t0l_ticks = (ratio * WS2812_T0L_NS as f32) as u16; 
+        let ws2812_t1h_ticks = (ratio * WS2812_T1H_NS as f32) as u16; 
+        let ws2812_t1l_ticks = (ratio * WS2812_T1L_NS as f32) as u16;
+        Led {
+            rmt, 
+            bit1: Item::new(ws2812_t1h_ticks, true, ws2812_t1l_ticks, false),
+            bit0: Item::new(ws2812_t0h_ticks, true, ws2812_t0l_ticks, false),
+    
+        }
+    }
+
+    pub fn write_color(&mut self, color: [u8; 3]) {
+        
+        const NUM_BITS: usize = 24;
+    
+        let all_bits = u32::from_be_bytes([0, color[1], color[0], color[2]]);
+        for i in 0..NUM_BITS {
+            self.rmt.data[i] = if all_bits & (1 << (NUM_BITS - 1 - i)) != 0 {
+                self.bit1
+            } else {
+                self.bit0
+            };
+        }
+        // end marker
+        self.rmt.data[NUM_BITS] = Item::new(0, false, 0, false);
+    
+        // start transmission
+        self.rmt.start_tx(true);
+    }
+    
 }
 
 #[entry]
@@ -149,15 +199,33 @@ fn main() -> ! {
     // loop.
     let mut delay = Delay::new(peripherals.SYSTIMER);
 
-    let rmt0 = RMT0::new(io.pins.gpio6, peripherals.RMT, &peripherals.SYSTEM, 255, Some(false));
+    let rmt0 = RMT0::new(
+        io.pins.gpio8,
+        peripherals.RMT,
+        &peripherals.SYSTEM,
+        1,
+        Some(false),
+    );
 
-    rmt0.data[..MORSE_DATA.len()].copy_from_slice(&MORSE_DATA);
+    let mut led = Led::new(rmt0);
+
+    const L: u8 = 0;
+    const H: u8 = 10;
+    let colors = [
+        [H, L, L],
+        [H, H, L],
+        [L, H, L],
+        [L, H, H],
+        [L, L, H],
+        [H, L, H],
+    ];
 
     loop {
         writeln!(serial0, "Hello world!").unwrap();
 
-        rmt0.start_tx(true);
-
-        delay.delay_ms(10000u32);
+        for color in colors {
+            led.write_color(color);
+            delay.delay_ms(500u32);
+        }
     }
 }
