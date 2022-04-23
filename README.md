@@ -1,6 +1,6 @@
-# esp32-c3 hello world
+# esp32-c3: RGB LED example using the rmt peripheral
 
-Minimal hello world example project for bare-metal no_std esp32-c3. Heavily copied from [esp-hal](https://github.com/esp-rs/esp-hal/tree/main/esp32c3-hal).
+Prototypical implementation of using the rmt peripheral of the esp32-c3 to drive an WS2812 rgb led. Works directly on top of [esp-hal](https://github.com/esp-rs/esp-hal/tree/main/esp32c3-hal) and doesn't require esp-idf.
 
 ## Preparation
 

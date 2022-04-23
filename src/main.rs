@@ -18,6 +18,8 @@ const WS2812_T0H_NS: u32 = 400;
 const WS2812_T0L_NS: u32 = 800;
 const WS2812_T1H_NS: u32 = 850;
 const WS2812_T1L_NS: u32 = 450;
+const WS2812_RESET: u32 = 75000;
+// const WS2812_TOLERANCE: u32 = 150;
 
 #[derive(Debug, Clone, Copy)]
 struct Item(u32);
@@ -67,16 +69,11 @@ impl RMT0 {
         // setup clock and divider
         sys_conf.modify(|_r, w| w.rmt_sclk_active().clear_bit());
         sys_conf.modify(|_r, w| unsafe {
-            w.rmt_sclk_sel()
-                .bits(1) // use APB_CLK
-                .rmt_sclk_div_num()
-                .bits(0)
-                .rmt_sclk_div_a()
-                .bits(0)
-                .rmt_sclk_div_b()
-                .bits(0)
-                .rmt_sclk_active()
-                .set_bit()
+            w.rmt_sclk_sel().bits(1) // use APB_CLK
+                .rmt_sclk_div_num().bits(0)
+                .rmt_sclk_div_a().bits(0)
+                .rmt_sclk_div_b().bits(0)
+                .rmt_sclk_active().set_bit()
         });
         ch0conf0
             .modify(|_, w| unsafe { w.div_cnt_ch0().bits(clk_div).carrier_en_ch0().clear_bit() });
@@ -127,6 +124,15 @@ impl RMT0 {
         ch0conf0.modify(|_, w| w.tx_start_ch0().set_bit());
     }
 
+    pub fn wait_tx_done(&self) -> nb::Result<(), ()> {
+        // TODO: find documentation about the meaning of that state flag. What's
+        // written below seems to work, but it'd be better to know for sure
+        if self.rmt.ch0status.read().state_ch0().bits() == 0 {
+            return Ok(());
+        }
+        return Err(nb::Error::WouldBlock);
+    }
+
     pub fn counter_clk_hz(&self) -> u32 {
         self.counter_clk_hz
     }
@@ -137,6 +143,7 @@ pub struct Led {
     rmt: RMT0,
     bit0: Item,
     bit1: Item,
+    end: Item,
 }
 
 impl Led {
@@ -146,11 +153,17 @@ impl Led {
         let ws2812_t0l_ticks = (ratio * WS2812_T0L_NS as f32) as u16; 
         let ws2812_t1h_ticks = (ratio * WS2812_T1H_NS as f32) as u16; 
         let ws2812_t1l_ticks = (ratio * WS2812_T1L_NS as f32) as u16;
+        // TODO: Check that accurracy of the timing is within allowed range
+        let ws2812_reset = ratio * WS2812_RESET as f32;
+        if ws2812_reset >= (1<<15) as f32 {
+            // TODO: proper error handling
+            panic!("Reset not supported by current clock settings");
+        }
         Led {
             rmt, 
             bit1: Item::new(ws2812_t1h_ticks, true, ws2812_t1l_ticks, false),
             bit0: Item::new(ws2812_t0h_ticks, true, ws2812_t0l_ticks, false),
-    
+            end: Item::new(ws2812_reset as u16, false, 0, false),
         }
     }
 
@@ -167,10 +180,13 @@ impl Led {
             };
         }
         // end marker
-        self.rmt.data[NUM_BITS] = Item::new(0, false, 0, false);
+        self.rmt.data[NUM_BITS] = self.end;
     
         // start transmission
         self.rmt.start_tx(true);
+
+        // wait until transmission is done
+        nb::block!(self.rmt.wait_tx_done()).unwrap();
     }
     
 }
@@ -220,11 +236,12 @@ fn main() -> ! {
         [H, L, H],
     ];
 
-    loop {
-        writeln!(serial0, "Hello world!").unwrap();
+    writeln!(serial0, "Hello world!").unwrap();
 
+    loop {
         for color in colors {
             led.write_color(color);
+            nb::block!(led.rmt.wait_tx_done()).unwrap();
             delay.delay_ms(500u32);
         }
     }
